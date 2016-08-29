@@ -104,7 +104,7 @@
                 ;; Just to nothing
                 )
                (t
-                (vom:error "Unexpected error (Code: ~D)" errno)
+              ;  (vom:error "Unexpected error (Code: ~D)" errno)
                 (close-socket socket))))
            (return))
           (0

@@ -6,10 +6,9 @@
                 :*evloop*
                 :with-sockaddr)
   (:import-from :woo.queue
-                :make-queue
-                :queue-empty-p
-                :enqueue
-                :dequeue)
+                :make-multiqueue
+                :multiqueue-enqueue
+                :multiqueue-dequeue)
   (:export :make-cluster
            :stop-cluster
            :kill-cluster
@@ -22,16 +21,14 @@
 
 (defstruct (worker (:constructor %make-worker))
   (id (incf *worker-counter*))
-  (queue (make-queue))
+  (random-state (make-random-state t))
   evloop
   dequeue-async
   stop-async
   process-fn
   thread
+  main-queue
   (status :running))
-
-(defun add-job (worker job)
-  (enqueue job (worker-queue worker)))
 
 (defun notify-new-job (worker)
   (lev:ev-async-send (worker-evloop worker) (worker-dequeue-async worker)))
@@ -50,9 +47,9 @@
 
 (cffi:defcallback worker-dequeue :void ((evloop :pointer) (listener :pointer) (events :int))
   (declare (ignore evloop listener events))
-  (loop with queue = (worker-queue *worker*)
-        until (queue-empty-p queue)
-        for socket = (dequeue queue)
+  (loop with queue = (worker-main-queue *worker*)
+        for (socket found) = (multiple-value-list (multiqueue-dequeue queue (worker-random-state *worker*)))
+        while found
         do (funcall (worker-process-fn *worker*) socket)))
 
 (cffi:defcallback worker-stop :void ((evloop :pointer) (listener :pointer) (events :int))
@@ -66,13 +63,7 @@
   (lev:ev-break evloop lev:+EVBREAK-ALL+))
 
 (defun finalize-worker (worker)
-  (with-slots (evloop queue dequeue-async stop-async thread status) worker
-    (unless (queue-empty-p queue)
-      (if *cluster*
-          (loop until (queue-empty-p queue)
-                do (add-job-to-cluster *cluster* (dequeue queue)))
-          (vom:warn "Finalizing a worker having some jobs.")))
-
+  (with-slots (evloop dequeue-async stop-async thread status) worker
     (cffi:foreign-free dequeue-async)
     (cffi:foreign-free stop-async)
     (setf evloop nil
@@ -81,12 +72,13 @@
           thread nil
           status :stopped)))
 
-(defun make-worker (process-fn when-died)
+(defun make-worker (process-fn when-died main-queue)
   (let* ((dequeue-async (cffi:foreign-alloc '(:struct lev:ev-async)))
          (stop-async (cffi:foreign-alloc '(:struct lev:ev-async)))
          (worker (%make-worker :dequeue-async dequeue-async
                                :stop-async stop-async
-                               :process-fn process-fn))
+                               :process-fn process-fn
+                               :main-queue main-queue))
          (worker-lock (bt:make-lock)))
     (lev:ev-async-init dequeue-async 'worker-dequeue)
     (lev:ev-async-init stop-async 'worker-stop)
@@ -114,36 +106,28 @@
     worker))
 
 (defstruct (cluster (:constructor %make-cluster
-                        (&optional
-                           workers
-                         &aux
-                           (circular-workers
-                            (apply #'alexandria:circular-list workers)))))
-  (workers '() :read-only t)
-  (circular-workers '()))
-
-(defun (setf cluster-workers) (workers cluster)
-  (setf (slot-value cluster 'workers) workers)
-  (setf (cluster-circular-workers cluster)
-        (apply #'alexandria:circular-list workers)))
+                        (queue &optional workers)))
+  (workers '())
+  queue
+  (random-state (make-random-state t)))
 
 (defun add-job-to-cluster (cluster job)
-  (let* ((workers (cluster-circular-workers cluster))
-         (worker (car workers)))
-    (add-job worker job)
-    (notify-new-job worker)
-    (setf (cluster-circular-workers cluster)
-          (cdr workers))))
+  (multiqueue-enqueue job
+                      (cluster-queue cluster)
+                      (cluster-random-state cluster))
+  (mapc #'notify-new-job
+        (cluster-workers cluster)))
 
 (defun make-cluster (worker-num process-fn)
-  (let ((cluster (%make-cluster)))
+  (let ((cluster (%make-cluster (make-multiqueue worker-num))))
     (labels ((make-new-worker ()
                (vom:debug "Starting a new worker...")
                (make-worker process-fn
                             (lambda (worker)
                               (setf (cluster-workers cluster)
                                     (cons (make-new-worker)
-                                          (remove worker (cluster-workers cluster) :test #'eq)))))))
+                                          (remove worker (cluster-workers cluster) :test #'eq))))
+                            (cluster-queue cluster))))
       (setf (cluster-workers cluster)
             (loop repeat worker-num
                   collect (make-new-worker))))

@@ -71,6 +71,8 @@
   (when (stringp listen)
     (setf listen (pathname listen)))
   (check-type listen (or pathname null))
+  (format t "MultiQueue! Workers: ~A~%" worker-num)
+
 
   (let ((*app* app)
         (*debug* debug)

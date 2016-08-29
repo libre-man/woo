@@ -37,7 +37,7 @@
                #+sbcl :sb-posix
                #+linux :uiop
                #+sbcl :sb-concurrency
-               #-sbcl :cl-speedy-queue)
+               :cl-speedy-queue)
   :components ((:module "src"
                 :components
                 ((:file "woo" :depends-on ("ev" "response" "worker" "signal" "specials"))
